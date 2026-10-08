@@ -1,0 +1,11 @@
+{
+  "apiVersion": 2,
+  "name": "cer-authorize-net/renewal-opt-in",
+  "version": "1.0.7",
+  "title": "Automatic renewal opt-in",
+  "description": "Authorize.Net automatic payment opt-in for existing manual subscription renewals.",
+  "category": "woocommerce",
+  "parent": ["woocommerce/checkout-fields-block"],
+  "supports": {"html": false, "multiple": false, "reusable": false},
+  "textdomain": "cer-authorize-net"
+}
