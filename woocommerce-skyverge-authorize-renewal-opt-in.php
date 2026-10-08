@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WooCommerece SkyVerge Authorize.Net Renewal Opt-In
  * Description: Allow the customer to opt-in to automatic payments when renewing an existing manual subscription through Block Checkout.
- * Version: 1.0.1
+ * Version: 1.0.4
  * Author: FirstTracks Marketing
  * Author URI: https://firsttracksmarketing.com
  * Requires Plugins: woocommerce, woocommerce-subscriptions, woocommerce-gateway-authorize-net-cim
@@ -15,6 +15,7 @@ final class CER_Authorize_Net {
     const CONSENT = '_cer_authnet_consent';
     const TRANSACTION = '_cer_authnet_transaction';
     const LABEL = 'Enable Auto Renewal';
+    private static $pending_orders = array();
     public static function details() {
         $store_name = wp_specialchars_decode( get_bloginfo( 'name' ), ENT_QUOTES );
         return sprintf( 'By selecting this option, I authorize %s to save the payment method above to my account and automatically charge it for future membership renewals.', $store_name );
@@ -29,6 +30,11 @@ final class CER_Authorize_Net {
             if ( in_array( $new, array( 'processing', 'completed' ), true ) ) { self::queue( $id ); }
         }, 100, 3 );
         add_action( 'cer_authnet_apply_opt_in', array( __CLASS__, 'apply' ) );
+        add_action( 'shutdown', array( __CLASS__, 'flush' ), 100 );
+        // Subscriptions renders its information at priority 15. At that point
+        // the gateway has completed payment but has not yet fired its final
+        // transaction-data hook, so the subscription can still appear manual.
+        add_action( 'woocommerce_email_after_order_table', array( __CLASS__, 'email_auto_renew_notice' ), 16, 3 );
         foreach ( self::GATEWAYS as $id ) {
             add_filter( 'wc_payment_gateway_' . $id . '_process_payment', array( __CLASS__, 'force_save' ), 100, 3 );
             add_action( 'wc_payment_gateway_' . $id . '_add_transaction_data', array( __CLASS__, 'transaction' ), 100, 3 );
@@ -93,7 +99,7 @@ final class CER_Authorize_Net {
         if ( ! in_array( $id, self::GATEWAYS, true ) ) { return null; }
         $gateways = WC()->payment_gateways()->payment_gateways();
         $gateway = isset( $gateways[ $id ] ) ? $gateways[ $id ] : null;
-        foreach ( array( 'get_payment_tokens_handler', 'get_order_meta', 'get_order_meta_prefix', 'get_customer_id', 'get_environment', 'tokenization_enabled' ) as $method ) {
+        foreach ( array( 'get_payment_tokens_handler', 'get_order_meta', 'update_order_meta', 'get_customer_id', 'get_environment', 'tokenization_enabled' ) as $method ) {
             if ( ! is_object( $gateway ) || ! is_callable( array( $gateway, $method ) ) ) { return null; }
         }
         return $gateway;
@@ -157,27 +163,15 @@ final class CER_Authorize_Net {
 
     public static function transaction( $order, $response, $gateway ) {
         if ( ! self::consent_record( $order ) ) { return; }
-        // Read the token from the transaction's runtime payment object, never
-        // from potentially inherited renewal-order payment metadata.
-        $token = '';
-        $class = get_class( $gateway );
-        do {
-            $pos = strrpos( $class, '\\' );
-            $dynamic = false !== $pos ? substr( $class, 0, $pos ) . '\\Dynamic_Props' : '';
-            if ( $dynamic && class_exists( $dynamic ) && is_callable( array( $dynamic, 'get' ) ) ) {
-                $token = $dynamic::get( $order, 'payment', 'token' );
-                break;
-            }
-            $class = get_parent_class( $class );
-        } while ( $class );
-        // Older SkyVerge framework versions use public runtime order properties.
-        if ( ! $token && isset( $order->payment ) && is_object( $order->payment ) && isset( $order->payment->token ) ) {
-            $token = $order->payment->token;
-        }
+        // SkyVerge has already persisted the exact token and customer ID used
+        // for this transaction before firing this action. Reading those values
+        // through its public API works across framework versions and HPOS.
+        $token = $gateway->get_order_meta( $order, 'payment_token' );
         $order->update_meta_data( self::TRANSACTION, array(
             'order_id' => $order->get_id(), 'token' => (string) $token,
             'customer_id' => (string) $gateway->get_order_meta( $order, 'customer_id' ),
             'environment' => $gateway->get_environment(),
+            'trans_date' => (string) $gateway->get_order_meta( $order, 'trans_date' ),
         ) );
         $order->save_meta_data();
     }
@@ -185,12 +179,83 @@ final class CER_Authorize_Net {
     public static function queue( $order_id ) {
         $order = wc_get_order( $order_id );
         if ( ! $order || ! self::consent_record( $order ) || ! $order->is_paid() ) { return; }
-        // Run after Subscriptions has finished processing the early renewal.
+        // Apply at shutdown, after the gateway and Subscriptions have finished
+        // processing this request. Keep a scheduled action as a fallback for
+        // asynchronous gateways and interrupted requests.
+        self::$pending_orders[ (int) $order_id ] = (int) $order_id;
         if ( function_exists( 'as_schedule_single_action' ) ) {
             as_schedule_single_action( time() + 15, 'cer_authnet_apply_opt_in', array( (int) $order_id ), 'cer-authnet', true );
         } elseif ( ! wp_next_scheduled( 'cer_authnet_apply_opt_in', array( (int) $order_id ) ) ) {
             wp_schedule_single_event( time() + 15, 'cer_authnet_apply_opt_in', array( (int) $order_id ) );
         }
+    }
+
+    public static function flush() {
+        foreach ( self::$pending_orders as $order_id ) {
+            self::apply( $order_id );
+        }
+        self::$pending_orders = array();
+    }
+
+    public static function email_auto_renew_notice( $order, $sent_to_admin, $plain_text = false ) {
+        if ( $sent_to_admin || ! $order instanceof WC_Order || ! function_exists( 'wcs_get_subscription' ) ) { return; }
+        $consent = self::consent_record( $order );
+        if ( ! $consent || empty( $consent['targets'] ) ) { return; }
+
+        $subscriptions = array();
+        foreach ( array_unique( array_map( 'absint', $consent['targets'] ) ) as $id ) {
+            $subscription = wcs_get_subscription( $id );
+            if ( $subscription instanceof WC_Subscription
+                && (int) $subscription->get_user_id() === (int) $order->get_user_id()
+                && $subscription->get_time( 'next_payment' ) > 0 ) {
+                $subscriptions[] = $subscription;
+            }
+        }
+        if ( ! $subscriptions ) { return; }
+
+        // On a resend the opt-in has already been applied, and the native
+        // Subscriptions template has printed this notice at priority 15.
+        foreach ( $subscriptions as $subscription ) {
+            if ( ! $subscription->is_manual() ) { return; }
+        }
+
+        if ( 1 === count( $subscriptions ) ) {
+            $account_url = $subscriptions[0]->get_view_order_url();
+        } else {
+            $account_url = wc_get_endpoint_url( 'subscriptions', '', wc_get_page_permalink( 'myaccount' ) );
+        }
+
+        if ( $plain_text ) {
+            printf(
+                "\n%s\n",
+                sprintf(
+                    _n(
+                        'This subscription is set to renew automatically using your payment method on file. You can manage or cancel this subscription from your my account page: %s',
+                        'These subscriptions are set to renew automatically using your payment method on file. You can manage or cancel your subscriptions from your my account page: %s',
+                        count( $subscriptions ),
+                        'cer-authorize-net'
+                    ),
+                    esc_url_raw( $account_url )
+                )
+            );
+            return;
+        }
+
+        printf(
+            '<p style="margin: -32px 0 40px;"><small>%s</small></p>',
+            wp_kses_post(
+                sprintf(
+                    _n(
+                        'This subscription is set to renew automatically using your payment method on file. You can manage or cancel this subscription from your %1$smy account page%2$s.',
+                        'These subscriptions are set to renew automatically using your payment method on file. You can manage or cancel your subscriptions from your %1$smy account page%2$s.',
+                        count( $subscriptions ),
+                        'cer-authorize-net'
+                    ),
+                    '<a href="' . esc_url( $account_url ) . '">',
+                    '</a>'
+                )
+            )
+        );
     }
 
     public static function apply( $order_id ) {
@@ -209,31 +274,55 @@ final class CER_Authorize_Net {
             return;
         }
         try {
-            if ( ! self::gateway_allowed( $gateway ) || ! is_array( $transaction ) || empty( $transaction['token'] ) || empty( $transaction['customer_id'] )
+            if ( ! self::gateway_allowed( $gateway ) || ! is_array( $transaction ) || empty( $transaction['token'] ) || empty( $transaction['customer_id'] ) || empty( $transaction['trans_date'] )
                 || (int) $transaction['order_id'] !== (int) $order_id
                 || $transaction['environment'] !== $gateway->get_environment()
                 || ! $gateway->get_payment_tokens_handler()->user_has_token( $order->get_user_id(), $transaction['token'] )
                 || (string) $gateway->get_customer_id( $order->get_user_id() ) !== $transaction['customer_id'] ) {
                 throw new \RuntimeException( 'The renewal transaction did not provide a verified saved payment profile. Automatic renewal was not enabled.' );
             }
-            $related = wcs_get_subscriptions_for_order( $order, array( 'order_type' => array( 'renewal' ) ) );
+            $related = wcs_get_subscriptions_for_order( $order, array( 'order_type' => 'renewal' ) );
+            $related_by_id = array();
+            foreach ( $related as $related_subscription ) {
+                if ( $related_subscription instanceof WC_Subscription ) {
+                    $related_by_id[ (int) $related_subscription->get_id() ] = $related_subscription;
+                }
+            }
+            $updated = array();
             foreach ( $consent['targets'] as $id ) {
-                $sub = isset( $related[ $id ] ) ? $related[ $id ] : null;
-                if ( ! $sub || (int) $sub->get_meta( '_cer_authnet_enabled_order' ) === (int) $order_id ) { continue; }
-                if ( ! self::eligible( $sub, $order->get_user_id() ) ) { continue; }
-                $prefix = $gateway->get_order_meta_prefix();
-                $sub->update_meta_data( $prefix . 'payment_token', $transaction['token'] );
-                $sub->update_meta_data( $prefix . 'customer_id', $transaction['customer_id'] );
-                $sub->update_meta_data( $prefix . 'environment', $transaction['environment'] );
+                $id = absint( $id );
+                $sub = isset( $related_by_id[ $id ] ) ? $related_by_id[ $id ] : null;
+                if ( ! $sub ) {
+                    throw new \RuntimeException( sprintf( 'Subscription #%d is not related to renewal order #%d. Automatic renewal was not enabled.', $id, $order_id ) );
+                }
+                if ( (int) $sub->get_meta( '_cer_authnet_enabled_order' ) === (int) $order_id ) {
+                    $updated[] = $id;
+                    continue;
+                }
+                if ( ! self::eligible( $sub, $order->get_user_id() ) ) {
+                    throw new \RuntimeException( sprintf( 'Subscription #%d is no longer eligible for automatic renewal opt-in.', $id ) );
+                }
+                // Use SkyVerge's own subscription meta API. Its Subscriptions
+                // integration requires only payment_token and customer_id.
+                $gateway->update_order_meta( $sub, 'payment_token', $transaction['token'] );
+                $gateway->update_order_meta( $sub, 'customer_id', $transaction['customer_id'] );
                 $sub->set_payment_method( $gateway );
                 $sub->set_requires_manual_renewal( false );
                 $sub->update_meta_data( '_cer_authnet_enabled_order', (int) $order_id );
                 $sub->save();
+                $updated[] = $id;
                 if ( self::staging() ) {
                     $sub->add_order_note( 'Sandbox opt-in test: a test payment profile was attached. WooCommerce staging protection remains enabled; scheduled automatic charges stay disabled.' );
                 }
                 $sub->add_order_note( sprintf( 'Customer opted into automatic renewals at checkout for renewal order #%d. Authorize.Net payment profile verified and attached.', $order_id ) );
                 $order->add_order_note( sprintf( 'Automatic renewals enabled for subscription #%d following the customer checkout opt-in.', $id ) );
+            }
+            if ( count( $updated ) !== count( array_unique( array_map( 'absint', $consent['targets'] ) ) ) ) {
+                throw new \RuntimeException( 'Not every selected subscription was updated. Automatic renewal opt-in will be retried.' );
+            }
+            if ( $order->get_meta( '_cer_authnet_error' ) ) {
+                $order->delete_meta_data( '_cer_authnet_error' );
+                $order->save_meta_data();
             }
         } catch ( \Throwable $error ) {
             $message = $error->getMessage();
